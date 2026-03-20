@@ -1,0 +1,102 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-prvt-posdevice-location-deployment
+  namespace: dev-anq
+  labels:
+    app: fraud-prvt-posdevice-location
+spec:
+  selector:
+    matchLabels:
+      app: fraud-prvt-posdevice-location
+  replicas: 1
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: fraud-prvt-posdevice-location
+      annotations:
+        dapr.io/app-id: posdevice-location
+        dapr.io/app-port: '8080'
+        dapr.io/config: tracing
+        dapr.io/enabled: 'true'
+        dapr.io/log-as-json: 'true'
+        dapr.io/sidecar-liveness-probe-timeout-seconds: '10'
+        dapr.io/sidecar-readiness-probe-timeout-seconds: '10'
+    spec:
+      containers:
+        - name: fraud-prvt-posdevice-location
+          image: coureregistry.azurecr.io/fraud-prvt-posdevice-location:latest
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+          - name: MongoDbSettings__ConnectionString
+            valueFrom:
+              secretKeyRef:
+                name: fraud-prvt-posdevice-location-secrets
+                key: MongoDbSettingsConnectionString
+          - name: MongoDbSettings__AnqConnectionString
+            valueFrom:
+              secretKeyRef:
+                name: fraud-prvt-posdevice-location-secrets
+                key: MongoDbSettingsAnqConnectionString
+          - name: MongoDbSettings__BillingConnectionString
+            valueFrom:
+              secretKeyRef:
+                name: fraud-prvt-posdevice-location-secrets
+                key: MongoDbSettingsBillingConnectionString
+          - name: RedisCache__ConnectionString
+            valueFrom:
+              secretKeyRef:
+                name: fraud-prvt-posdevice-location-secrets
+                key: RedisCacheConnectionString
+          - name: AuthServerSettings__TestApiKey
+            valueFrom:
+              secretKeyRef:
+                name: fraud-prvt-posdevice-location-secrets
+                key: AuthServerSettingsTestApiKey
+          - name: MongoDbSettings__DatabaseName
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-prvt-posdevice-location-config
+                key: MongoDbSettingsDatabaseName
+          - name: MongoDbSettings__AnqDatabaseName
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-prvt-posdevice-location-config
+                key: MongoDbSettingsAnqDatabaseName
+          - name: MongoDbSettings__BillingDatabaseName
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-prvt-posdevice-location-config
+                key: MongoDbSettingsBillingDatabaseName
+          - name: RedisCache__InstanceName
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-prvt-posdevice-location-config
+                key: RedisCacheInstanceName
+          - name: ElasticConfiguration__Uri
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-prvt-posdevice-location-config
+                key: ElasticConfigurationUri
+          - name: AuthServerSettings__BaseUrl
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-prvt-posdevice-location-config
+                key: AuthServerSettingsBaseUrl
+      imagePullSecrets:
+        - name: docker-creds
