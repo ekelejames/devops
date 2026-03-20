@@ -11,12 +11,14 @@ set -e
 # - Injects secrets and configmap mappings into each env's deployment
 # - Creates ArgoCD applications (gated by DEPLOY_STAGE env var in pipeline)
 # - Generates ingress YAML and updates the shared ingress kustomization
+#
+# Compatibility: bash 3.2+ (macOS default). No associative arrays used.
 # =============================================================================
 
 # =============================================================================
 # HARDCODED CONFIGURATION — update these to match your environment
 # =============================================================================
-ARGOCD_SERVER="http://localhost:8082"
+ARGOCD_SERVER="localhost:8082"
 ARGOCD_USERNAME="admin"
 ARGOCD_PASSWORD="8zJjXj3Jthy2Jeaz"          # Inject via pipeline secret
 DEVOPS_REPO="https://github.com/ekelejames/devops.git"
@@ -125,11 +127,11 @@ echo ""
 echo "============================================================"
 echo "  DevOps Automation — App Onboarding"
 echo "============================================================"
-echo "  App name     : ${APP_NAME}"
-echo "  Source repo  : ${REPO_URL}"
-echo "  Ingress type : ${INGRESS_TYPE}"
+echo "  App name      : ${APP_NAME}"
+echo "  Source repo   : ${REPO_URL}"
+echo "  Ingress type  : ${INGRESS_TYPE}"
 echo "  Container port: ${CONTAINER_PORT}"
-echo "  Deploy stage : ${DEPLOY_STAGE:-<all — local run>}"
+echo "  Deploy stage  : ${DEPLOY_STAGE:-<all — local run>}"
 echo "============================================================"
 echo ""
 
@@ -138,12 +140,10 @@ echo ""
 # Strips common prefixes to produce a short path slug.
 # e.g. fraud-prvt-posdevice-location -> posdevice-location
 #      anq-cms-wks                   -> cms-wks
-# Strips (in order): fraud-prvt-, anq-, coure-
 # =============================================================================
 derive_slug() {
   local name="$1"
   local slug="$name"
-  # Strip known prefixes iteratively
   for prefix in "fraud-prvt-" "fraudprevention-" "kyc-" "coure-" "anq-"; do
     slug="${slug#$prefix}"
   done
@@ -152,6 +152,38 @@ derive_slug() {
 
 APP_SLUG=$(derive_slug "$APP_NAME")
 echo "ℹ️  Derived ingress path slug: ${APP_SLUG}"
+
+# =============================================================================
+# LOOKUP HELPERS (replaces declare -A — bash 3.2 compatible)
+# =============================================================================
+
+# Returns the Kubernetes namespace for a given environment
+get_namespace() {
+  case "$1" in
+    dev)     echo "$NS_DEV" ;;
+    staging) echo "$NS_STAGING" ;;
+    prod)    echo "$NS_PROD" ;;
+    *) echo "❌ Unknown env: $1" >&2; exit 1 ;;
+  esac
+}
+
+# Returns the ingress host for a given ingress type and environment
+get_ingress_host() {
+  local type="$1"  # dmz | tcp | udp
+  local env="$2"   # dev | staging | prod
+  case "${type}_${env}" in
+    dmz_dev)     echo "$DMZ_HOST_DEV" ;;
+    dmz_staging) echo "$DMZ_HOST_STAGING" ;;
+    dmz_prod)    echo "$DMZ_HOST_PROD" ;;
+    tcp_dev)     echo "$TCP_HOST_DEV" ;;
+    tcp_staging) echo "$TCP_HOST_STAGING" ;;
+    tcp_prod)    echo "$TCP_HOST_PROD" ;;
+    udp_dev)     echo "$UDP_HOST_DEV" ;;
+    udp_staging) echo "$UDP_HOST_STAGING" ;;
+    udp_prod)    echo "$UDP_HOST_PROD" ;;
+    *) echo "❌ Unknown ingress type/env combo: ${type}/${env}" >&2; exit 1 ;;
+  esac
+}
 
 # =============================================================================
 # PATHS
@@ -190,13 +222,6 @@ fi
 
 # =============================================================================
 # CREATE FOLDER STRUCTURE
-# apps/<app-name>/
-#   dev/
-#     deployment.yaml
-#     service.yaml
-#     kustomization.yaml
-#   staging/  (same)
-#   prod/     (same)
 # =============================================================================
 echo "📁 Creating app folder structure at: ${APP_DIR}"
 mkdir -p "${APP_DIR}/dev"
@@ -207,7 +232,7 @@ mkdir -p "${APP_DIR}/prod"
 # HELPER: Build env block from secrets mapping file
 # =============================================================================
 build_env_block_from_secrets() {
-  local mapping_file="$1"  # path to <app>-secrets.yaml
+  local mapping_file="$1"
   local block=""
 
   if [ ! -f "$mapping_file" ]; then
@@ -224,11 +249,11 @@ build_env_block_from_secrets() {
     local k8s_key env_name
     k8s_key=$(yq eval ".mappings[$i].k8sKey" "$mapping_file")
     env_name=$(yq eval ".mappings[$i].envName" "$mapping_file")
-    block+="        - name: ${env_name}
-          valueFrom:
-            secretKeyRef:
-              name: ${secret_name}
-              key: ${k8s_key}
+    block+="          - name: ${env_name}
+            valueFrom:
+              secretKeyRef:
+                name: ${secret_name}
+                key: ${k8s_key}
 "
   done
   echo "$block"
@@ -238,7 +263,7 @@ build_env_block_from_secrets() {
 # HELPER: Build env block from config mapping file
 # =============================================================================
 build_env_block_from_config() {
-  local mapping_file="$1"  # path to <app>-config.yaml
+  local mapping_file="$1"
   local block=""
 
   if [ ! -f "$mapping_file" ]; then
@@ -255,11 +280,11 @@ build_env_block_from_config() {
     local k8s_key env_name
     k8s_key=$(yq eval ".mappings[$i].k8sKey" "$mapping_file")
     env_name=$(yq eval ".mappings[$i].envName" "$mapping_file")
-    block+="        - name: ${env_name}
-          valueFrom:
-            configMapKeyRef:
-              name: ${config_name}
-              key: ${k8s_key}
+    block+="          - name: ${env_name}
+            valueFrom:
+              configMapKeyRef:
+                name: ${config_name}
+                key: ${k8s_key}
 "
   done
   echo "$block"
@@ -269,20 +294,23 @@ build_env_block_from_config() {
 # HELPER: Render deployment.yaml for a given environment
 # =============================================================================
 generate_deployment() {
-  local env="$1"         # dev | staging | prod
-  local namespace="$2"   # dev-anq | staging-anq | app-prod
+  local env="$1"
+  local namespace="$2"
   local out_file="$3"
 
-  # Collect env vars from mapping files (if k8s/ folder exists in source repo)
-  local secrets_block="" config_block="" full_env_block=""
+  local secrets_block="" config_block=""
   if [ -d "$SOURCE_K8S" ]; then
     secrets_block=$(build_env_block_from_secrets "${SOURCE_K8S}/${APP_NAME}-secrets.yaml")
     config_block=$(build_env_block_from_config   "${SOURCE_K8S}/${APP_NAME}-config.yaml")
   fi
 
+  # env: sits at the container level (10-space indent).
+  # A blank line between secrets and config blocks prevents line-merging in the output.
+  local env_section=""
   if [ -n "$secrets_block" ] || [ -n "$config_block" ]; then
-    full_env_block="      env:
-${secrets_block}${config_block}"
+    env_section="          env:
+${secrets_block}
+${config_block}"
   fi
 
   cat > "$out_file" <<EOF
@@ -330,7 +358,7 @@ spec:
           ports:
             - containerPort: ${CONTAINER_PORT}
               name: http
-${full_env_block}
+${env_section}
       imagePullSecrets:
         - name: docker-creds
 EOF
@@ -393,14 +421,8 @@ EOF
 # =============================================================================
 # GENERATE MANIFESTS FOR ALL THREE ENVIRONMENTS
 # =============================================================================
-declare -A ENV_NAMESPACES=(
-  [dev]="$NS_DEV"
-  [staging]="$NS_STAGING"
-  [prod]="$NS_PROD"
-)
-
 for env in dev staging prod; do
-  ns="${ENV_NAMESPACES[$env]}"
+  ns=$(get_namespace "$env")
   env_dir="${APP_DIR}/${env}"
 
   echo ""
@@ -423,7 +445,6 @@ generate_ingress_dmz() {
   local host="$3"
   local out_file="$4"
 
-  # Prod has no namespace in manifest
   local ns_line=""
   if [ "$env" != "prod" ]; then
     ns_line="  namespace: ${namespace}"
@@ -465,7 +486,7 @@ generate_ingress_tcp_udp() {
   local env="$1"
   local namespace="$2"
   local host="$3"
-  local ingress_class="$4"   # tcp-nginx | udp-nginx
+  local ingress_class="$4"
   local out_file="$5"
 
   local ns_line=""
@@ -473,7 +494,6 @@ generate_ingress_tcp_udp() {
     ns_line="  namespace: ${namespace}"
   fi
 
-  # UDP gets extra timeout annotations
   local extra_annotations=""
   if [ "$ingress_class" == "udp-nginx" ]; then
     extra_annotations="    nginx.ingress.kubernetes.io/proxy-read-timeout: '600'
@@ -514,27 +534,23 @@ EOF
   echo "  ✅ ingress (${ingress_class}) → ${out_file}"
 }
 
-# Map env → hosts and generate ingress files
-declare -A DMZ_HOSTS=([dev]="$DMZ_HOST_DEV" [staging]="$DMZ_HOST_STAGING" [prod]="$DMZ_HOST_PROD")
-declare -A TCP_HOSTS=([dev]="$TCP_HOST_DEV" [staging]="$TCP_HOST_STAGING" [prod]="$TCP_HOST_PROD")
-declare -A UDP_HOSTS=([dev]="$UDP_HOST_DEV" [staging]="$UDP_HOST_STAGING" [prod]="$UDP_HOST_PROD")
-
+# Generate ingress files for each environment
 for env in dev staging prod; do
-  ns="${ENV_NAMESPACES[$env]}"
+  ns=$(get_namespace "$env")
+  host=$(get_ingress_host "$INGRESS_TYPE" "$env")
   ingress_env_dir="${INGRESS_BASE}/overlays/${env}/external-apis/${INGRESS_TYPE}"
   mkdir -p "$ingress_env_dir"
   ingress_out="${ingress_env_dir}/${APP_NAME}.yaml"
 
   case "$INGRESS_TYPE" in
-    dmz) generate_ingress_dmz     "$env" "$ns" "${DMZ_HOSTS[$env]}" "$ingress_out" ;;
-    tcp) generate_ingress_tcp_udp "$env" "$ns" "${TCP_HOSTS[$env]}" "tcp-nginx" "$ingress_out" ;;
-    udp) generate_ingress_tcp_udp "$env" "$ns" "${UDP_HOSTS[$env]}" "udp-nginx" "$ingress_out" ;;
+    dmz) generate_ingress_dmz     "$env" "$ns" "$host" "$ingress_out" ;;
+    tcp) generate_ingress_tcp_udp "$env" "$ns" "$host" "tcp-nginx" "$ingress_out" ;;
+    udp) generate_ingress_tcp_udp "$env" "$ns" "$host" "udp-nginx" "$ingress_out" ;;
   esac
 done
 
 # =============================================================================
 # UPDATE INGRESS KUSTOMIZATION.YAML FOR EACH ENV
-# Appends the new resource entry if not already present
 # =============================================================================
 echo ""
 echo "🔧 Updating ingress kustomization files..."
@@ -544,21 +560,20 @@ for env in dev staging prod; do
   new_entry="- external-apis/${INGRESS_TYPE}/${APP_NAME}.yaml"
 
   if [ ! -f "$kust_file" ]; then
-    echo "  ⚠️  kustomization.yaml not found for [${env}]: ${kust_file} — skipping"
+    echo "  ℹ️  [${env}] kustomization.yaml not found — creating it..."
+    mkdir -p "$(dirname "$kust_file")"
+    printf -- "---\napiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n%s\n" "$new_entry" > "$kust_file"
+    echo "  ✅ [${env}] Created kustomization.yaml with entry '${new_entry}'"
     continue
   fi
 
-  # Check if entry already exists
   if grep -qF "$new_entry" "$kust_file"; then
     echo "  ℹ️  [${env}] Entry already exists in kustomization.yaml — skipping"
   else
-    # Append under the resources: block — find last resource line and insert after it
-    # We append at end of file as the kustomization resources list just grows
     echo "$new_entry" >> "$kust_file"
     echo "  ✅ [${env}] Appended '${new_entry}' to kustomization.yaml"
   fi
 
-  # Also update ingress-extention.txt tracker
   tracker="${INGRESS_BASE}/overlays/${env}/external-apis/ingress-extention.txt"
   if [ -f "$tracker" ]; then
     if ! grep -qF "$new_entry" "$tracker"; then
@@ -567,6 +582,42 @@ for env in dev staging prod; do
     fi
   fi
 done
+
+# =============================================================================
+# COMMIT AND PUSH GENERATED FILES TO DEVOPS REPO
+# ArgoCD reads from the remote repo — files must be pushed before app creation.
+# =============================================================================
+echo ""
+echo "============================================================"
+echo "  Git Commit & Push"
+echo "============================================================"
+
+(
+  cd "$DEVOPS_REPO_PATH"
+
+  if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo "❌ ${DEVOPS_REPO_PATH} is not a git repository. Cannot commit."
+    exit 1
+  fi
+
+  echo "📦 Staging generated files..."
+  git add "apps/${APP_NAME}/"
+  git add "ingress/overlays/"
+
+  if git diff --cached --quiet; then
+    echo "ℹ️  Nothing to commit — files may already be tracked."
+  else
+    echo "💬 Committing: onboard app ${APP_NAME}..."
+    git commit -m "chore: onboard ${APP_NAME} — auto-generated by devops-automation.sh"
+
+    echo "⬆️  Pushing to remote..."
+    git push
+
+    echo "✅ Changes pushed to devops repo."
+    echo "⏳ Waiting 10s for GitHub to register the push before ArgoCD app creation..."
+    sleep 10
+  fi
+)
 
 # =============================================================================
 # ARGOCD APP CREATION
@@ -579,8 +630,7 @@ done
 create_argocd_app() {
   local env="$1"
   local namespace="$2"
-  local app_path="apps/${APP_NAME}/${env}"  # path inside devops repo
-
+  local app_path="apps/${APP_NAME}/${env}"
   local argocd_app_name="${APP_NAME}-${env}"
 
   echo ""
@@ -589,18 +639,6 @@ create_argocd_app() {
   echo "   Path    : ${app_path}"
   echo "   NS      : ${namespace}"
 
-  if [ -z "$ARGOCD_PASSWORD" ]; then
-    echo "  ❌ ARGOCD_PASSWORD is not set. Cannot login to ArgoCD."
-    exit 1
-  fi
-
-  # Login
-  argocd login "$ARGOCD_SERVER" \
-    --username "$ARGOCD_USERNAME" \
-    --password "$ARGOCD_PASSWORD" \
-    --insecure
-
-  # Create app (idempotent — upsert)
   argocd app create "$argocd_app_name" \
     --repo "$DEVOPS_REPO" \
     --path "$app_path" \
@@ -612,6 +650,8 @@ create_argocd_app() {
     --upsert
 
   echo "  ✅ ArgoCD app '${argocd_app_name}' created/updated."
+  echo "  ⏳ Waiting 5s before next app..."
+  sleep 5
 }
 
 echo ""
@@ -623,6 +663,20 @@ if ! command -v argocd &>/dev/null; then
   echo "⚠️  argocd CLI not found. Skipping ArgoCD app creation."
   echo "   Install it or ensure it is on PATH in your pipeline agent."
 else
+  if [ -z "$ARGOCD_PASSWORD" ]; then
+    echo "❌ ARGOCD_PASSWORD is not set. Cannot login to ArgoCD."
+    exit 1
+  fi
+
+  echo "🔐 Logging into ArgoCD at ${ARGOCD_SERVER}..."
+  argocd login "$ARGOCD_SERVER" \
+    --username "$ARGOCD_USERNAME" \
+    --password "$ARGOCD_PASSWORD" \
+    --insecure
+  echo "✅ Logged in."
+  echo "⏳ Waiting 3s before creating apps..."
+  sleep 3
+
   case "${DEPLOY_STAGE:-all}" in
     dev)
       create_argocd_app "dev" "$NS_DEV"
